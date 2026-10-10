@@ -244,3 +244,6 @@ tools/third_party/torch_hub/
 .idea/
 .vscode/
 .claude/
+# Local virtualenv and editor backups
+.venv_agent/
+*.bak_*
