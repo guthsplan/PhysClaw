@@ -1,0 +1,12 @@
+{
+    "llm_model": "Qwen/Qwen3.8-27B",
+    "llm_base_url": "https://api.tokenfactory.nebius.com/v1",
+    "llm_api_key": "${NEBIUS_API_KEY}",
+    "roles": {
+        "main": { "max_tokens": 16384, "temperature": 0.6 },
+        "planning": { "max_tokens": 16384, "temperature": 0.6 },
+        "general": { "max_tokens": 16384, "temperature": 0.6 },
+        "vlm": { "max_tokens": 8192, "temperature": 0.6 },
+        "vlm_grounding": { "max_tokens": 4096, "temperature": 0.6 }
+    }
+}
