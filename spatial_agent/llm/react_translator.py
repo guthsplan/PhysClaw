@@ -4,7 +4,7 @@ The ReAct baseline constrains the LLM to emit one structured tool call per
 step. This module parses the ``{"tool": ..., "args": {...}}`` payload and
 converts it to a single-line assignment like::
 
-    result_<step> = tools.SAM3.segment_image_by_text(image=InputImages[0], prompt="red car")
+    result_<step> = tools.SAM3.segment(target="red car", frame=InputImages[0])
 
 which is then handed to ``execute_node`` unchanged. Arguments are
 **Python expression strings** validated by a restricted AST walker so the
@@ -14,7 +14,7 @@ comprehensions, no nested calls).
 Arg expressions may contain **one method call** per leaf, and only when the
 call's receiver chain is rooted at a kernel-bound name (``result_<N>`` or
 one of the built-in constants). This unlocks patterns like
-``result_3.get_centroid_3d(result_1, frame=result_0.frame_indices[0], object=0)``
+``result_3.centroid()``
 without permitting arbitrary code to be smuggled in.
 """
 
@@ -23,7 +23,7 @@ from typing import Any, Dict
 
 
 ALLOWED_TOOL_PREFIXES = ("tools.",)
-ALLOWED_FULL_NAMES = {"vlm.locate", "vlm.ask_with_thinking", "ReturnAnswer", "show"}
+ALLOWED_FULL_NAMES = {"vlm.locate", "vlm.locate_box", "vlm.locate_points", "vlm.ask_with_thinking", "ReturnAnswer", "show"}
 
 
 _LITERAL_AST_NODES = (
@@ -217,7 +217,7 @@ def _validate_tool_path(tool: str) -> None:
     if len(parts) < 3 or not all(parts):
         raise ValueError(
             f"tool path {tool!r} is incomplete. Expected "
-            f"tools.<Module>.<method> (e.g. tools.SAM3.segment_image_by_text)."
+            f"tools.<Module>.<method> (e.g. tools.SAM3.segment)."
         )
     # Block import-time name lookups like tools.__class__ etc.
     for p in parts[1:]:

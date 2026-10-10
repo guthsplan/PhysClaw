@@ -1,0 +1,32 @@
+{
+ "llm_model": "gpt-5.6-sol",
+ "llm_base_url": "https://api.openai.com/v1",
+ "llm_api_key": "${OPENAI_API_KEY}",
+ "roles": {
+  "main": {
+   "max_tokens": 8192,
+   "temperature": 1.0
+  },
+  "planning": {
+   "max_tokens": 8192,
+   "temperature": 1.0
+  },
+  "general": {
+   "max_tokens": 8192,
+   "temperature": 1.0
+  },
+  "vlm": {
+   "max_tokens": 4096,
+   "temperature": 1.0
+  },
+  "vlm_grounding": {
+   "max_tokens": 2048,
+   "temperature": 1.0
+  }
+ },
+ "vlm_provider": {
+  "llm_model": "claude-fable-5-1",
+  "llm_base_url": "https://api.anthropic.com/v1/",
+  "llm_api_key": "${ANTHROPIC_API_KEY}"
+ }
+}

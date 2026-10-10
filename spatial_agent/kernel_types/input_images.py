@@ -12,7 +12,7 @@ class InputImages(list):
 
     Subclasses ``list`` so it passes ``isinstance(obj, list)`` checks
     in downstream tools (e.g. Reconstruct) and can be used directly
-    as ``tools.Reconstruct.Reconstruct(InputImages, ...)``.
+    as ``tools.Reconstruct.run(InputImages[:32])``.
 
     Each element is a ``FrameImage`` — a PIL-compatible wrapper that
     carries a ``.frame_index`` attribute.  This means ``InputImages[i]``

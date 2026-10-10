@@ -49,6 +49,17 @@ _UNHEALTHY_COOLDOWN_SEC = 60.0
 _HEALTH_CHECK_TIMEOUT_SEC = 3
 
 
+def _model_rejects_temperature(model_id: str) -> bool:
+    """True for models that reject `max_tokens`/non-default `temperature`
+    (GPT-5/o-series reasoning models, and Claude models via Anthropic's
+    OpenAI-compatible endpoint — both want `max_completion_tokens` only)."""
+    return (
+        model_id.startswith("gpt-5")
+        or (model_id[:1] == "o" and model_id[1:2].isdigit())
+        or model_id.startswith("claude")
+    )
+
+
 def image_to_base64_url(img: Image.Image, max_size: int = 1024) -> str:
     """Encode a PIL image as a base64 data URI, resizing if needed."""
     w, h = img.size
@@ -104,6 +115,23 @@ class LLMClient:
             or "bearer"
         )
         self._is_vllm = config.llm_base_url.lower().strip() == "vllm"
+        # GPT-5 / o-series reasoning models reject `max_tokens` (they want
+        # `max_completion_tokens`) and any temperature other than the default.
+        _m = (config.llm_model or "").lower().split("/")[-1]
+        self._is_reasoning_model = _model_rejects_temperature(_m)
+
+        # Optional secondary provider for the vlm role only (vlm.locate /
+        # vlm.locate_points / vlm.locate_box / vlm.ask_with_thinking) — see
+        # SpatialAgentConfig.vlm_llm_model. Empty means "use the main model
+        # above for vlm calls too", the historical behavior.
+        self._vlm_model = getattr(config, "vlm_llm_model", "") or None
+        self._vlm_base_url = getattr(config, "vlm_llm_base_url", "") or None
+        self._vlm_api_key = getattr(config, "vlm_llm_api_key", "") or None
+        self._vlm_is_reasoning_model = (
+            _model_rejects_temperature((self._vlm_model or "").lower().split("/")[-1])
+            if self._vlm_model else False
+        )
+        self._vlm_client: Optional[AsyncOpenAI] = None  # lazy, single static endpoint (not pooled)
 
         # Client pool: endpoint URL -> AsyncOpenAI
         self._client_pool: Dict[str, AsyncOpenAI] = {}
@@ -142,6 +170,7 @@ class LLMClient:
         # AsyncOpenAI clients contain _thread.RLock and httpx sessions
         # that cannot be pickled — drop them; they'll be recreated lazily.
         state["_client_pool"] = {}
+        state["_vlm_client"] = None
         state["_discovery_lock"] = None
         state["_active_requests"] = defaultdict(int)
         # threading.Lock is not picklable — recreate on the other side.
@@ -368,6 +397,15 @@ class LLMClient:
             self._client_pool[endpoint] = client
         return client
 
+    def _get_vlm_client(self) -> AsyncOpenAI:
+        """Get or create the (single, unpooled) client for the vlm-role provider."""
+        if self._vlm_client is None:
+            self._vlm_client = AsyncOpenAI(
+                api_key=self._vlm_api_key or self._api_key,
+                base_url=self._vlm_base_url or self._endpoints[0],
+            )
+        return self._vlm_client
+
     async def close(self) -> None:
         """Close all pooled clients. Call on shutdown."""
         for ep, client in self._client_pool.items():
@@ -376,6 +414,12 @@ class LLMClient:
             except Exception:
                 pass
         self._client_pool.clear()
+        if self._vlm_client is not None:
+            try:
+                await self._vlm_client.close()
+            except Exception:
+                pass
+            self._vlm_client = None
 
     # ------------------------------------------------------------------
     # Token usage tracking
@@ -454,14 +498,24 @@ class LLMClient:
     # API kwargs builder
     # ------------------------------------------------------------------
 
-    def _build_api_kwargs(self, params: LLMRoleParams) -> Dict[str, Any]:
+    def _build_api_kwargs(
+        self, params: LLMRoleParams, is_reasoning_model: Optional[bool] = None,
+    ) -> Dict[str, Any]:
         """Build kwargs for chat.completions.create from role params.
 
         Always includes: model, max_tokens, temperature.
         Standard OpenAI params if set: top_p, presence_penalty.
         vLLM-only params in extra_body if set: top_k, min_p,
         repetition_penalty, enable_thinking.
+
+        ``is_reasoning_model`` overrides ``self._is_reasoning_model`` — used
+        by the vlm-role provider, which may be a different model than the
+        main model this client was constructed for.
         """
+        if is_reasoning_model is None:
+            is_reasoning_model = self._is_reasoning_model
+        if is_reasoning_model:
+            return {"max_completion_tokens": params.max_tokens}
         kwargs: Dict[str, Any] = {
             "max_tokens": params.max_tokens,
             "temperature": params.temperature,
@@ -686,7 +740,11 @@ class LLMClient:
         Retries on transient errors and waits for server if unavailable.
         """
         params = role_params or self.config.vlm_params
-        api_kwargs = self._build_api_kwargs(params)
+        use_vlm_provider = self._vlm_model is not None
+        model_name = self._vlm_model if use_vlm_provider else self._model
+        api_kwargs = self._build_api_kwargs(
+            params, is_reasoning_model=self._vlm_is_reasoning_model if use_vlm_provider else None,
+        )
 
         # Build multimodal message
         user_content: List[Dict[str, Any]] = []
@@ -713,13 +771,17 @@ class LLMClient:
             is_connection_failure = False
 
             for attempt in range(max_retries):
-                endpoint = self._pick_endpoint(session_id)
-                client = self._get_client(endpoint)
+                if use_vlm_provider:
+                    endpoint = self._vlm_base_url or "vlm-provider"
+                    client = self._get_vlm_client()
+                else:
+                    endpoint = self._pick_endpoint(session_id)
+                    client = self._get_client(endpoint)
                 self._track_request_start(endpoint)
                 try:
                     response = await asyncio.wait_for(
                         client.chat.completions.create(
-                            model=self._model,
+                            model=model_name,
                             messages=messages,
                             **api_kwargs,
                         ),
@@ -728,7 +790,7 @@ class LLMClient:
                 except self._RETRYABLE_ERRORS as exc:
                     last_exc = exc
                     is_connection_failure = isinstance(exc, self._CONNECTION_ERRORS)
-                    if is_connection_failure:
+                    if is_connection_failure and not use_vlm_provider:
                         self._mark_unhealthy(endpoint)
                     logger.warning(
                         "[LLMClient] VLM attempt %d/%d failed (%s: %s), retrying...",

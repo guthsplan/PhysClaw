@@ -32,32 +32,27 @@ All methods are **static** — call directly on `tools.Geometry`.
 
 | Method | Signature | Returns | Description |
 |--------|-----------|---------|-------------|
-| `euclidean_distance` | `(p1, p2)` | `float` | 3D Euclidean distance between two points |
-| `angle_between_vectors` | `(v1, v2)` | `float` (degrees) | Angle between two 3D vectors |
-| `project_point_to_camera` | `(point_3d, c2w, fx, fy, cx, cy)` | `(u, v)` or `None` | Project world point to pixel; `None` if behind camera |
-| `rotation_matrix_from_vectors` | `(v_from, v_to)` | `(3, 3)` array | Rotation aligning v_from to v_to |
-| `transform_points` | `(points, matrix)` | same shape | Apply (4, 4) SE(3) to (..., 3) points |
-| `fit_ground_plane_ransac` | `(points, confidence)` | `(normal, mask)` or `(None, None)` | RANSAC ground plane |
-| `normalized_to_pixel` | `(coords, width, height)` | `list[float]` | Convert 0-1000 normalized coords to pixels |
+| `distance` | `(p1, p2)` | `float` | scalar distance between two points — "how far apart" |
+| `displacement` | `(p1, p2)` | vector `p2 - p1` | direction + magnitude; `/ dt` gives a **velocity** vector |
+| `norm` | `(v)` | `float` | magnitude — `norm(velocity)` is **speed** |
+| `path_length` | `(points)` | `float` | total length along an ordered sequence of points (≠ `distance(first, last)`) |
+| `angle_between_vectors` | `(v1, v2)` | `float` degrees | angle between two 3D vectors |
+| `project_point_to_camera` | `(point_3d, c2w, fx, fy, cx, cy)` | `(u, v)` or `None` | world point → pixel (`None` if behind camera) |
+| `transform_points` | `(points, matrix)` | same shape | apply a (4, 4) SE(3) to (..., 3) points |
 
-**Input**: `p1`, `p2`, `v1`, `v2`, `point_3d` must be **1D arrays of length 3**.
-If you have per-pixel data `(H, W, 3)`, index the pixel first: `points[y, x]`.
+Points/vectors may be 2D or 3D (`angle_between_vectors`/`project_point_to_camera` need 3D). Per-pixel data `(H, W, 3)` — index first: `points[y, x]`.
 
 ```python
-# 3D distance between two object centroids (using absolute frame index):
-fi = seg.frame_indices[0]
-c1 = seg.get_centroid_3d(recon, frame=fi, object=0)  # (3,)
-c2 = seg.get_centroid_3d(recon, frame=fi, object=1)  # (3,)
-dist = tools.Geometry.euclidean_distance(c1, c2)
-
-# Convert 0-1000 normalized coords to pixels:
-px, py = tools.Geometry.normalized_to_pixel((vlm_x, vlm_y), W, H)
+c1 = recon.centroid(frame, seg.mask(0)); c2 = recon.centroid(frame, seg.mask(1))
+dist = tools.Geometry.distance(c1, c2)
+velocity = tools.Geometry.displacement(p_t0, p_t1) / (t1 - t0)   # vector
+speed = tools.Geometry.norm(velocity)                             # scalar
 ```
 """
 
     @staticmethod
     def euclidean_distance(p1, p2) -> float:
-        """3D Euclidean distance between two points."""
+        """Euclidean distance between two points. See `distance` (same thing, clearer name)."""
         p1 = np.asarray(p1, dtype=np.float64).ravel()
         p2 = np.asarray(p2, dtype=np.float64).ravel()
         if p1.shape != p2.shape:
@@ -65,6 +60,55 @@ px, py = tools.Geometry.normalized_to_pixel((vlm_x, vlm_y), W, H)
                 f"p1 shape {p1.shape} and p2 shape {p2.shape} must match."
             )
         return float(np.linalg.norm(p1 - p2))
+
+    @staticmethod
+    def distance(p1, p2) -> float:
+        """Scalar distance between two points (2D or 3D) — magnitude only.
+
+        For a **vector** (e.g. to compute velocity), use `displacement` instead.
+        """
+        return GeometryUtils.euclidean_distance(p1, p2)
+
+    @staticmethod
+    def displacement(p1, p2) -> np.ndarray:
+        """Vector from `p1` to `p2` (`p2 - p1`) — a direction and magnitude, not just a scalar.
+
+        Divide by `dt` for a velocity vector; take `norm()` of that for speed.
+        """
+        p1 = np.asarray(p1, dtype=np.float64).ravel()
+        p2 = np.asarray(p2, dtype=np.float64).ravel()
+        if p1.shape != p2.shape:
+            raise ValueError(
+                f"p1 shape {p1.shape} and p2 shape {p2.shape} must match."
+            )
+        return p2 - p1
+
+    @staticmethod
+    def norm(v) -> float:
+        """Magnitude of a vector, e.g. `norm(velocity)` -> speed."""
+        v = np.asarray(v, dtype=np.float64).ravel()
+        return float(np.linalg.norm(v))
+
+    @staticmethod
+    def path_length(points) -> float:
+        """Total arc length through an ordered sequence of points.
+
+        Sum of consecutive-point distances — NOT the same as
+        `distance(points[0], points[-1])`, which ignores the path in between.
+        Use this for "total distance travelled"; use `displacement`/`distance`
+        between two specific timestamps for velocity/speed.
+
+        Args:
+            points: `(N, D)` array-like of N points (D=2 or 3), N >= 2.
+        """
+        pts = np.asarray(points, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[0] < 2:
+            raise ValueError(
+                f"`points` must be a sequence of at least 2 points with shape "
+                f"(N, D), got shape {pts.shape}."
+            )
+        diffs = np.diff(pts, axis=0)
+        return float(np.sum(np.linalg.norm(diffs, axis=1)))
 
     @staticmethod
     def angle_between_vectors(v1, v2) -> float:
@@ -266,7 +310,8 @@ px, py = tools.Geometry.normalized_to_pixel((vlm_x, vlm_y), W, H)
 
     def __repr__(self) -> str:
         return (
-            "GeometryUtils(static methods: euclidean_distance, angle_between_vectors, "
+            "GeometryUtils(static methods: distance, displacement, path_length, norm, "
+            "euclidean_distance, angle_between_vectors, "
             "project_point_to_camera, rotation_matrix_from_vectors, transform_points, "
             "fit_ground_plane_ransac, normalized_to_pixel)"
         )

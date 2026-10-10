@@ -133,6 +133,14 @@ class SpatialAgentConfig:
     llm_base_url: str = ""  # 'vllm' triggers serve.json auto-discovery
     llm_api_key: str = ""
 
+    # --- Optional secondary provider for the vlm role only (vlm.locate /
+    # vlm.locate_points / vlm.locate_box / vlm.ask_with_thinking) ---
+    # Empty = vlm role uses the main llm_model/llm_base_url/llm_api_key
+    # above, unchanged. Set via a "vlm_provider" block in the model JSON.
+    vlm_llm_model: str = ""
+    vlm_llm_base_url: str = ""
+    vlm_llm_api_key: str = ""
+
     # --- LLM Role Parameters ---
     main_params: LLMRoleParams = field(default_factory=LLMRoleParams)
     vlm_params: LLMRoleParams = field(
@@ -208,6 +216,7 @@ class SpatialAgentConfig:
     max_show_images_per_step: int = -1  # per-step cap (-1 = disabled)
     max_show_images_per_session: int = 250  # total show() images per session (-1 = unlimited)
     show_image_labels: bool = True  # white padding with label on top of show() images
+    max_images_in_context: int = -1  # cap on total images in one LLM prompt (provider limit; -1 = disabled). Oldest feedback images are evicted first.
 
     # --- GPU Server ---
     gpu_server: str = "auto"  # "auto" discovers from gpu_server.json; "http://host:port" for direct
@@ -299,6 +308,21 @@ class SpatialAgentConfig:
         for key in ("llm_model", "llm_base_url", "llm_api_key"):
             if key in data and data[key] is not None:
                 setattr(self, key, _expand_env_vars(data[key]))
+
+        # Optional secondary provider for the vlm role only:
+        #   "vlm_provider": {"llm_model": "...", "llm_base_url": "...", "llm_api_key": "${VAR}"}
+        # Any key omitted here leaves that piece falling back to the main
+        # connection params above (e.g. sharing llm_api_key across providers
+        # is NOT done automatically — set all three together).
+        vlm_provider = data.get("vlm_provider")
+        if isinstance(vlm_provider, dict):
+            for key, attr in (
+                ("llm_model", "vlm_llm_model"),
+                ("llm_base_url", "vlm_llm_base_url"),
+                ("llm_api_key", "vlm_llm_api_key"),
+            ):
+                if key in vlm_provider and vlm_provider[key] is not None:
+                    setattr(self, attr, _expand_env_vars(vlm_provider[key]))
 
         # Role params
         roles = data.get("roles", {})

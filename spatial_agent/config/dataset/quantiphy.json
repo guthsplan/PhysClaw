@@ -1,0 +1,5 @@
+{
+    "benchmark": "quantiphy",
+    "video_max_fps": 4,
+    "num_key_frames": 8
+}

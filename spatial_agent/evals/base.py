@@ -300,14 +300,26 @@ def extract_video_frames(
         print(f"[Warning] Video not found: {video_path}")
         return [], [], 0.0, 0
 
+    # The cache is keyed by the extraction parameters too: frames sampled at
+    # 4 fps must not be served to a run that asked for 15 fps. Each parameter
+    # combination lives in its own subdirectory of the per-video cache dir.
+    variant = f"fps{video_max_fps:g}" if video_max_fps else "native"
+    if video_frame_resize_short_edge:
+        variant += f"_se{video_frame_resize_short_edge}"
+    cache_dir = os.path.join(cache_dir, variant)
+
     # Check cache
     meta_path = os.path.join(cache_dir, "meta.json")
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             meta = json.load(f)
+        params_match = (
+            meta.get("video_max_fps") == video_max_fps
+            and meta.get("resize_short_edge") == video_frame_resize_short_edge
+        )
         # Only use cache if it has frames (don't trust empty caches from
         # earlier cv2-based extraction that failed on AV1/VP9 codecs)
-        if meta["frame_files"]:
+        if params_match and meta["frame_files"]:
             frame_paths = [os.path.join(cache_dir, fn) for fn in meta["frame_files"]]
             if all(os.path.exists(p) for p in frame_paths):
                 return (
@@ -318,7 +330,7 @@ def extract_video_frames(
     try:
         os.makedirs(cache_dir, exist_ok=True)
     except OSError:
-        cache_dir = fallback_video_frame_cache_dir(video_path)
+        cache_dir = os.path.join(fallback_video_frame_cache_dir(video_path), variant)
         os.makedirs(cache_dir, exist_ok=True)
         meta_path = os.path.join(cache_dir, "meta.json")
 
@@ -366,6 +378,8 @@ def extract_video_frames(
         "frame_files": [os.path.basename(p) for p in frame_paths],
         "fps": fps,
         "total_video_frames": total,
+        "video_max_fps": video_max_fps,
+        "resize_short_edge": video_frame_resize_short_edge,
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f)

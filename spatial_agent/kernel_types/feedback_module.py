@@ -4,7 +4,7 @@ VLM querying lives in ``vlm_module.VLMModule`` (injected as ``vlm``).
 
 Usage in the Jupyter kernel::
 
-    feedback.show(seg.visualize(fi))
+    feedback.show(seg.overlay())
     feedback.log_visual(some_visual)
 """
 

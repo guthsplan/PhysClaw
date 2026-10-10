@@ -47,7 +47,7 @@ conclusion or expected answer (e.g., "the car is moving left, right?"). Phrasing
 answer be formed from the images, not lead the answer.
 - **Manual coordinate guessing**: If the agent estimates coordinates from `show()` output \
 (e.g., "roughly at 60% width, 40% height"), this is WRONG. Flag it — the agent should use \
-`vlm.locate` to get precise 0-1000 normalized center points or bounding boxes instead.
+`vlm.locate(frame, target)` / `vlm.locate_box(frame, target)` to get precise pixel coordinates instead.
 
 ## What NOT to flag
 - Minor style issues or suboptimal but correct approaches.

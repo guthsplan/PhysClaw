@@ -10,7 +10,7 @@ object::
     **Next Goal**: Compute 3D centroid
     **Tool Call**:
     ```json
-    {"tool": "tools.SAM3.segment_image_by_text",
+    {"tool": "tools.SAM3.segment",
      "args": {"image": "InputImages[0]", "prompt": "\\"red car\\""}}
     ```
 

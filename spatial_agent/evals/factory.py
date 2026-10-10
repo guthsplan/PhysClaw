@@ -57,6 +57,7 @@ BENCHMARK_REGISTRY: Dict[str, BenchmarkSpec] = {
     "videomme": BenchmarkSpec("spatial_agent.evals.videomme", "VideoMMEBench", "Video-MME"),
     "videommev2": BenchmarkSpec("spatial_agent.evals.videommev2", "VideoMMEv2Bench", "Video-MME-v2"),
     # --- Sentinel ---
+    "quantiphy": BenchmarkSpec("spatial_agent.evals.quantiphy", "QuantiPhyBench", "QuantiPhy"),
     "none": BenchmarkSpec(None, None),
 }
 

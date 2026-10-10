@@ -1,0 +1,12 @@
+{
+    "llm_model": "gpt-4o",
+    "llm_base_url": "https://api.openai.com/v1",
+    "llm_api_key": "${OPENAI_API_KEY}",
+    "roles": {
+        "main": { "max_tokens": 4096, "temperature": 0.2 },
+        "planning": { "max_tokens": 4096, "temperature": 0.2 },
+        "general": { "max_tokens": 4096, "temperature": 0.2 },
+        "vlm": { "max_tokens": 4096, "temperature": 0.2 },
+        "vlm_grounding": { "max_tokens": 2048, "temperature": 0.2 }
+    }
+}

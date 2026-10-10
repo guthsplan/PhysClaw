@@ -1,0 +1,12 @@
+{
+ "llm_model": "claude-fable-5-1",
+ "llm_base_url": "https://api.anthropic.com/v1/",
+ "llm_api_key": "${ANTHROPIC_API_KEY}",
+ "roles": {
+  "main": {"max_tokens": 4096, "temperature": 0.2},
+  "planning": {"max_tokens": 4096, "temperature": 0.2},
+  "general": {"max_tokens": 4096, "temperature": 0.2},
+  "vlm": {"max_tokens": 2048, "temperature": 0.2},
+  "vlm_grounding": {"max_tokens": 1024, "temperature": 0.2}
+ }
+}

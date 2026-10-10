@@ -7,12 +7,33 @@ Every class carries ``frame_indices`` and enforces alignment via
 ``validate_alignment()``.
 """
 
+from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
 from PIL import Image
 
 from spatial_agent.kernel_types.visual_feedback import VisualFeedback
+
+
+@dataclass
+class Measured:
+    """A same-frame metric length from ``recon.distance``.
+
+    ``low``/``high`` bracket the 16th–84th percentile over endpoint jitter and
+    local depth variation. They do NOT include the reconstruction's global
+    scale error — check that against a known size in the same frame.
+    """
+
+    metres: float
+    low: float
+    high: float
+    xyz_a: Optional[np.ndarray]
+    xyz_b: Optional[np.ndarray]
+    n_samples: int
+
+    def __repr__(self) -> str:
+        return f"Measured({self.metres:.3f} m, 68% interval {self.low:.3f}–{self.high:.3f} m, n={self.n_samples})"
 
 
 class PerFrameData:
@@ -50,16 +71,28 @@ class PerFrameData:
     def __len__(self):
         return self.num_frames
 
-    def get_by_frame_index(self, abs_frame_idx: int) -> int:
-        """Return the local index for an absolute frame index."""
+    def get_by_frame_index(self, abs_frame_idx) -> int:
+        """Return the local index for an absolute frame index.
+
+        Also accepts a ``FrameImage`` directly (e.g. from ``tools.Video.frame(...)``
+        or ``InputImages[i]``) and reads its ``.frame_index`` — this is the
+        single choke point every ``[...]``/``get_mask``/``get_centroid_3d``/etc.
+        access goes through, so frame-object callers work everywhere at once.
+        """
+        from spatial_agent.kernel_types.frame_image import FrameImage
+
+        if isinstance(abs_frame_idx, FrameImage):
+            abs_frame_idx = abs_frame_idx.frame_index
         if not isinstance(abs_frame_idx, (int, np.integer)):
             raise TypeError(
-                f"Frame index must be an integer, got {type(abs_frame_idx).__name__}: {abs_frame_idx!r}.\n"
-                f"  Single frame: obj[frame_idx]\n"
+                f"Frame index must be an integer or FrameImage, got {type(abs_frame_idx).__name__}: {abs_frame_idx!r}.\n"
+                f"  Single frame: obj[frame_idx] or obj[a_frame_image]\n"
                 f"  Batch array: obj.camera_poses (extrinsics), obj.points (point map), obj.depth (depth)"
             )
+        abs_frame_idx = int(abs_frame_idx)
         if abs_frame_idx not in self._frame_indices:
             avail = self._frame_indices
+            nearest = min(avail, key=lambda f: abs(f - abs_frame_idx))
             hint = ""
             if abs_frame_idx == 0 and 0 not in avail:
                 hint = (
@@ -68,6 +101,7 @@ class PerFrameData:
                 )
             raise KeyError(
                 f"Frame {abs_frame_idx} not found in {avail}. "
+                f"Nearest available frame: {nearest}. "
                 f"Available frames: {avail}{hint}"
             )
         return self._frame_indices.index(abs_frame_idx)
@@ -196,16 +230,14 @@ class PerFrameMask(PerFrameData):
             conf_threshold: Minimum point-map confidence to include (default 0.3).
 
         Returns:
-            ``(3,)`` float32 array. Returns ``[nan, nan, nan]`` if the mask
-            is empty (safe for arithmetic; use ``np.isnan()`` to check).
+            ``(3,)`` float32 array, or ``None`` if the mask is empty at this
+            frame (one convention everywhere: check ``is None``).
         """
         mask_2d = self.get_mask(frame, object)
         local_r = recon.points.get_by_frame_index(frame)
         pts = recon.points.points[local_r][mask_2d]
         if len(pts) == 0:
-            obj_label = object if isinstance(object, str) else self.labels[self._resolve_object(object)]
-            print(f"[WARNING] get_centroid_3d: mask for '{obj_label}' at frame {frame} is empty — returning [nan, nan, nan]")
-            return np.array([float('nan')] * 3, dtype=np.float32)
+            return None
         # Filter by reconstruction confidence
         conf = recon.points.confidence[local_r][mask_2d]
         valid = conf > conf_threshold
@@ -361,6 +393,125 @@ class PerFrameMask(PerFrameData):
             f"  Use: seg.get_mask(frame={fi[0]}, object=0)  # (H, W) bool\n"
             f"  Use: seg.get_centroid_3d(recon, frame={fi[0]}, object=0)  # (3,) float32\n"
             f"  Use: seg.visualize({fi[0]})  # VisualFeedback"
+        )
+
+
+def _centroid_2d(mask: np.ndarray) -> Optional[tuple]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    return (float(xs.mean()), float(ys.mean()))
+
+
+def _bbox_2d(mask: np.ndarray) -> Optional[tuple]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
+
+class Mask(PerFrameMask):
+    """Single-frame segmentation result (``tools.SAM3.segment`` / ``segment_at``).
+
+    Holds ``count`` instances found on ONE frame. Index by instance ``i``;
+    the frame is implicit (``.frame_index``).
+    """
+
+    @classmethod
+    def _wrap(cls, pfm: "PerFrameMask") -> "Mask":
+        return cls(
+            masks=pfm.masks, labels=list(pfm.labels), object_ids=list(pfm.object_ids),
+            frame_indices=list(pfm.frame_indices), frames=pfm._frames,
+        )
+
+    @property
+    def frame_index(self) -> int:
+        return self._frame_indices[0]
+
+    @property
+    def count(self) -> int:
+        return self.num_objects
+
+    def mask(self, i: "int | str" = 0) -> np.ndarray:
+        """``(H, W)`` bool mask of instance ``i`` (index or label)."""
+        return self.get_mask(self.frame_index, i)
+
+    def centroid(self, i: "int | str" = 0) -> Optional[tuple]:
+        """``(x, y)`` pixel centroid of instance ``i``, or ``None`` if empty."""
+        return _centroid_2d(self.mask(i))
+
+    def bbox(self, i: "int | str" = 0) -> Optional[tuple]:
+        """``(x1, y1, x2, y2)`` pixel bounding box of instance ``i``, or ``None`` if empty."""
+        return _bbox_2d(self.mask(i))
+
+    def area(self, i: "int | str" = 0) -> int:
+        """Pixel area of instance ``i``."""
+        return int(self.mask(i).sum())
+
+    def overlay(self) -> VisualFeedback:
+        """Mask overlay on the frame, for ``show()``."""
+        return self.visualize(self.frame_index)
+
+    def __repr__(self) -> str:
+        return (
+            f"Mask(frame={self.frame_index}, count={self.count}, labels={self.labels})\n"
+            f"  seg.mask(i) (H,W) bool | seg.centroid(i) (x,y) | seg.bbox(i) | seg.area(i) | show(seg.overlay())"
+        )
+
+
+class Track(PerFrameMask):
+    """Multi-frame tracking result (``tools.SAM3.track`` / ``track_from``).
+
+    One object per ``target`` followed across ``frame_indices``. Index by
+    ``frame`` (a ``FrameImage`` or absolute index) and ``target`` (index or
+    label).
+    """
+
+    @classmethod
+    def _wrap(cls, pfm: "PerFrameMask") -> "Track":
+        return cls(
+            masks=pfm.masks, labels=list(pfm.labels), object_ids=list(pfm.object_ids),
+            frame_indices=list(pfm.frame_indices), frames=pfm._frames,
+        )
+
+    @property
+    def targets(self) -> List[str]:
+        return list(self.labels)
+
+    def mask(self, frame, target: "int | str" = 0) -> np.ndarray:
+        """``(H, W)`` bool mask of ``target`` at ``frame``."""
+        return self.get_mask(frame, target)
+
+    def visible(self, frame, target: "int | str" = 0) -> bool:
+        """Whether ``target`` has a non-empty mask at ``frame``."""
+        return bool(self.get_mask(frame, target).any())
+
+    def visible_frames(self, target: "int | str" = 0) -> List[int]:
+        """Absolute frame indices where ``target`` is visible."""
+        obj = self._resolve_object(target)
+        return [fi for local, fi in enumerate(self._frame_indices) if self.masks[local, obj].any()]
+
+    def centroid(self, frame, target: "int | str" = 0) -> Optional[tuple]:
+        """``(x, y)`` pixel centroid of ``target`` at ``frame``, or ``None`` if not visible."""
+        return _centroid_2d(self.get_mask(frame, target))
+
+    def bbox(self, frame, target: "int | str" = 0) -> Optional[tuple]:
+        """``(x1, y1, x2, y2)`` pixel box of ``target`` at ``frame``, or ``None`` if not visible."""
+        return _bbox_2d(self.get_mask(frame, target))
+
+    def overlay(self, frame=None) -> VisualFeedback:
+        """Mask overlay at ``frame`` (default: the first frame where target 0 is visible), for ``show()``."""
+        if frame is None:
+            vis = self.visible_frames(0) if self.num_objects else []
+            frame = vis[0] if vis else self._frame_indices[0]
+        return self.visualize(frame)
+
+    def __repr__(self) -> str:
+        fi = self._frame_indices
+        n_vis = [len(self.visible_frames(t)) for t in range(self.num_objects)]
+        return (
+            f"Track(frames={fi[0]}..{fi[-1]} ({len(fi)}), targets={self.labels}, visible={n_vis}/{len(fi)})\n"
+            f"  track.mask(frame) | track.visible(frame) | track.centroid(frame) (x,y) | show(track.overlay(frame))"
         )
 
 
@@ -567,6 +718,117 @@ class Reconstruction(PerFrameData):
 
         return self._render_multi_view(masks, labels, conf_threshold, ref_frame, ego_trajectory)
 
+    # ------------------------------------------------------------------
+    # 3D lookups
+    # ------------------------------------------------------------------
+
+    def point(
+        self, frame, xy, radius: int = 2, conf_threshold: float = 0.3,
+    ) -> Optional[np.ndarray]:
+        """3D world point at pixel ``(x, y)`` on ``frame``.
+
+        Medians confidence-filtered points over a small ``(2*radius+1)``
+        patch around the pixel to reduce single-pixel noise. Use this for
+        one point (from ``vlm.locate`` or ``tools.TAP.track``); for a whole
+        mask use ``centroid``.
+
+        Args:
+            frame: a ``FrameImage`` (or absolute frame index).
+            xy: ``(x, y)`` pixel coordinates.
+            radius: half-width of the averaging patch, in pixels.
+            conf_threshold: minimum point-map confidence to include.
+
+        Returns:
+            ``(3,)`` float32 array, or ``None`` if no confident point exists
+            in the patch.
+        """
+        local = self.points.get_by_frame_index(frame)
+        H, W = self.points.points.shape[1:3]
+        x, y = xy
+        xi, yi = int(round(x)), int(round(y))
+        x0, x1 = max(0, xi - radius), min(W, xi + radius + 1)
+        y0, y1 = max(0, yi - radius), min(H, yi + radius + 1)
+        if x0 >= x1 or y0 >= y1:
+            return None
+        patch_pts = self.points.points[local, y0:y1, x0:x1].reshape(-1, 3)
+        patch_conf = self.points.confidence[local, y0:y1, x0:x1].reshape(-1)
+        valid = patch_conf > conf_threshold
+        if not valid.any():
+            return None
+        return np.median(patch_pts[valid], axis=0)
+
+    def distance(
+        self, frame, xy_a, xy_b, jitter_px: int = 3, conf_threshold: float = 0.3,
+    ) -> Optional[Measured]:
+        """Metric distance between two pixels on ONE frame, with an interval.
+
+        Each endpoint is back-projected through this frame's point map; the
+        pair is re-measured with each endpoint jittered by ±``jitter_px`` in
+        x and y, and the median / 16th / 84th percentiles are returned. The
+        interval reflects endpoint localization and local depth noise only —
+        not the reconstruction's global scale, which only a known size in
+        the same frame can check (``known_m / recon.distance(...).metres``
+        is that scale factor).
+
+        Args:
+            frame: a ``FrameImage`` or absolute frame index.
+            xy_a, xy_b: pixel coordinates, e.g. from ``vlm.locate_points``.
+
+        Returns:
+            ``Measured``, or ``None`` if either endpoint has no confident
+            3D point nearby.
+        """
+        offs = [(0, 0), (jitter_px, 0), (-jitter_px, 0), (0, jitter_px), (0, -jitter_px)]
+        pts_a = [self.point(frame, (xy_a[0] + dx, xy_a[1] + dy), radius=1, conf_threshold=conf_threshold) for dx, dy in offs]
+        pts_b = [self.point(frame, (xy_b[0] + dx, xy_b[1] + dy), radius=1, conf_threshold=conf_threshold) for dx, dy in offs]
+        ds = [float(np.linalg.norm(pa - pb)) for pa in pts_a if pa is not None for pb in pts_b if pb is not None]
+        if len(ds) < 3:
+            return None
+        ds = np.asarray(ds)
+        return Measured(
+            metres=float(np.median(ds)), low=float(np.percentile(ds, 16)), high=float(np.percentile(ds, 84)),
+            xyz_a=pts_a[0], xyz_b=pts_b[0], n_samples=int(len(ds)),
+        )
+
+    def centroid(
+        self, frame, mask: np.ndarray, conf_threshold: float = 0.3,
+    ) -> Optional[np.ndarray]:
+        """3D median position of confidence-filtered points under an ``(H, W)`` bool mask.
+
+        ``recon.centroid(frame, seg.mask())`` / ``recon.centroid(frame,
+        track.mask(frame))``. Returns ``None`` when the mask is empty or has
+        no confident points.
+        """
+        local = self.points.get_by_frame_index(frame)
+        # Accept the Mask/Track objects directly — the frame is known here.
+        if isinstance(mask, Mask):
+            if mask.count == 0:
+                return None
+            mask = mask.mask(0)
+        elif isinstance(mask, Track):
+            mask = mask.mask(frame)
+        elif isinstance(mask, PerFrameMask):
+            mask = mask.get_mask(frame, 0)
+        hw = self.points.points.shape[1:3]
+        try:
+            arr = np.asarray(mask, dtype=bool)
+        except (TypeError, ValueError):
+            arr = None
+        if arr is None or arr.shape != hw:
+            got = f"shape {arr.shape}" if arr is not None else type(mask).__name__
+            raise ValueError(
+                f"`mask` must be an (H, W) = {hw} bool array, a Mask, or a Track — got {got}."
+            )
+        mask = arr
+        pts = self.points.points[local][mask]
+        if len(pts) == 0:
+            return None
+        conf = self.points.confidence[local][mask]
+        valid = conf > conf_threshold
+        if valid.sum() > 0:
+            pts = pts[valid]
+        return np.median(pts, axis=0)
+
     def _segment_from_prompts(self, prompts: List[str]) -> "PerFrameMask":
         """Segment objects using text prompts via the attached segmenter.
 
@@ -586,17 +848,30 @@ class Reconstruction(PerFrameData):
                     "Cannot segment: no input images stored in "
                     "Reconstruction."
                 )
-            return self._segmenter.segment_image(
-                self._input_images[0],
-                prompts,
-                frame_index=self.frame_indices[0],
+            # _segment_image_by_text takes one prompt string (and finds ALL
+            # matching instances) — merge one call per prompt along the
+            # object axis to preserve the old "N prompts -> N+ objects" shape.
+            per_prompt_masks, labels = [], []
+            for p in prompts:
+                pfm = self._segmenter._segment_image_by_text(self._input_images[0], p)
+                per_prompt_masks.append(pfm.masks)  # (1, N_obj_p, H, W)
+                labels.extend(pfm.labels)
+            stacked = np.concatenate(per_prompt_masks, axis=1)  # (1, N_obj, H, W)
+            return PerFrameMask(
+                masks=stacked,
+                labels=labels,
+                object_ids=list(range(len(labels))),
+                frame_indices=self.frame_indices,
             )
         else:
             # Try video segmentation first (requires video_source)
             has_video = getattr(self._segmenter, "_video_source", None) is not None
             if has_video:
-                return self._segmenter.segment_video(
-                    prompts, frame_indices=self.frame_indices,
+                return self._segmenter._segment_video_by_text(
+                    prompts,
+                    frame_indices=self.frame_indices,
+                    start_frame=min(self.frame_indices),
+                    end_frame=max(self.frame_indices) + 1,
                 )
             # Fallback: segment each static image independently and stack
             if self._input_images is None or len(self._input_images) == 0:
@@ -607,18 +882,21 @@ class Reconstruction(PerFrameData):
             per_frame_masks = []
             labels = None
             for img, fidx in zip(self._input_images, self.frame_indices):
-                pfm = self._segmenter.segment_image(
-                    img, prompts, frame_index=fidx,
-                )
-                per_frame_masks.append(pfm.masks)  # (1, N_obj, H, W)
+                per_prompt_masks = []
+                frame_labels = []
+                for p in prompts:
+                    pfm = self._segmenter._segment_image_by_text(img, p)
+                    per_prompt_masks.append(pfm.masks)  # (1, N_obj_p, H, W)
+                    frame_labels.extend(pfm.labels)
+                per_frame_masks.append(np.concatenate(per_prompt_masks, axis=1))  # (1, N_obj, H, W)
                 if labels is None:
-                    labels = pfm.labels
+                    labels = frame_labels
             # Stack along frame dim: (N_frames, N_obj, H, W)
             stacked = np.concatenate(per_frame_masks, axis=0)
             return PerFrameMask(
                 masks=stacked,
                 labels=labels,
-                object_ids=list(range(len(prompts))),
+                object_ids=list(range(len(labels))),
                 frame_indices=self.frame_indices,
             )
 

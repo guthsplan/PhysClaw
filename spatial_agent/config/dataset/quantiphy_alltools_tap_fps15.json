@@ -1,0 +1,15 @@
+{
+    "benchmark": "quantiphy",
+    "video_max_fps": 15,
+    "num_key_frames": 8,
+    "tools_to_use": [
+        "Reconstruct",
+        "SAM3",
+        "TAP"
+    ],
+    "max_steps": 15,
+    "enable_reflection": false,
+    "max_show_images_per_step": 6,
+    "max_images_in_context": 16,
+    "timeout_sec": 1200
+}

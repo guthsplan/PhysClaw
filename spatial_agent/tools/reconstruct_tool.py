@@ -26,8 +26,8 @@ class ReconstructTool(GPUTool):
 
     Usage::
 
-        recon = tools.Reconstruct.Reconstruct(InputImages[:32])
-        bev = recon.render_bev(masks=seg)  # VisualFeedback
+        recon = tools.Reconstruct.run(tools.Video.window(num_frames=32))
+        bev = recon.render_bev(masks=track)  # VisualFeedback
 
     """
 
@@ -35,30 +35,31 @@ class ReconstructTool(GPUTool):
 
     TOOL_PROMPT_SECTIONS = OrderedDict([
         ("api", """\
-### tools.Reconstruct - 3D/4D Reconstruction (GPU)
-- `tools.Reconstruct.Reconstruct(frames)` → `Reconstruction`
-  - **Max {reconstruct_max_frames} frames.** Raises error if exceeded. Subsample first.
-  - Best quality with 8-32 frames; diminishing returns beyond that.
-  - Frame indices are auto-extracted from `InputImages`. Pass `frame_indices=` only if using raw PIL images.
-  - Output is gravity-aligned: +Y = up in world frame, ground plane at Y ≈ 0. First camera looks toward -Z.
-  - Output spatial resolution matches the input frame resolution — no resizing needed when combining with SAM3 masks.
+### tools.Reconstruct — 3D Reconstruction (GPU)
+`recon = tools.Reconstruct.run(frames)` — `frames` is a window from `tools.Video.window(...)` (or one frame in a list).
+- **Max {reconstruct_max_frames} frames** — use `tools.Video.window(..., num_frames={reconstruct_max_frames})`. Best with 8-32 frames.
+- World frame is gravity-aligned: +Y up, ground at Y ≈ 0, first camera looks along -Z. Units: metres.
+- Same resolution as the input frames, so SAM3 masks apply directly.
 
-**Reconstruction attributes** (exact access patterns — use absolute frame indices):
+**3D lookups** (`frame` = a `FrameImage` or absolute index; return metres or `None` — check `is None`):
 ```
-recon.frame_indices          # list[int] — absolute frame indices
-recon.num_frames             # int — number of reconstructed frames
-recon.metric_scale           # float — scale factor (points in meters)
+xyz = recon.point(frame, (x, y))              # (3,) — one pixel, e.g. vlm.locate(...).xy or pt.xy(frame)
+xyz = recon.centroid(frame, seg.mask())        # (3,) — under a Mask instance
+xyz = recon.centroid(frame, track.mask(frame)) # (3,) — under a Track at that frame
+m   = recon.distance(frame, xy_a, xy_b)        # Measured(metres, low, high) — length between two pixels on the SAME frame
+```
+`recon.distance` is how to measure a size/length instead of eyeballing it: get the two endpoints with `vlm.locate_points(frame, ["top of ...", "bottom of ..."])`, then read `m.metres` (and `m.low`–`m.high`). Its interval covers endpoint/depth noise, **not** the reconstruction's overall scale — if the question gives a known size, measure that same object the same way and use `known_m / m.metres` as a scale factor for every distance from this `recon`. Never treat a displacement between two times as a size.
 
-# Access by ABSOLUTE frame index (NOT local array index):
-recon.depth[frame_idx]       # (H, W) float32 — depth at frame
-recon.extrinsics[frame_idx]  # (4, 4) float64 — camera-to-world SE(3)
-recon.intrinsics[frame_idx]  # dict(fx=, fy=, cx=, cy=) — intrinsics at frame
-recon.points[frame_idx]      # (H, W, 3) float32 — XYZ world coords at frame
+**Noise characteristics (read before differentiating)**: positions from `recon.centroid`/`recon.point` are per-frame monocular estimates — expect centimetre-level jitter between frames plus slow scale drift along the window. That is fine for sizes and for velocity over a long span, but a **second derivative of per-frame 3D positions is dominated by this noise** (noise/Δt² grows as frames get closer). For acceleration, track in pixel space (`tools.TAP.track` or `Track.centroid`), fit there, and convert with one scale factor from a known size measured in the same frame; if two windows disagree in sign, the measurement is broken — do not average them.
 
-# Raw batch arrays (use absolute-index API above when possible):
-recon.points.points          # np.ndarray (N, H, W, 3) float32
-recon.points.confidence      # np.ndarray (N, H, W)   float32
-recon.extrinsics.camera_poses  # np.ndarray (N, 4, 4) float64
+**Per-frame data** (index with a `FrameImage` or absolute frame index — never a local list index):
+```
+recon.frame_indices          # list[int] absolute
+recon.depth[frame]           # (H, W) float32
+recon.extrinsics[frame]      # (4, 4) camera-to-world SE(3)
+recon.intrinsics[frame]      # dict(fx=, fy=, cx=, cy=)
+recon.points[frame]          # (H, W, 3) world XYZ
+recon.metric_scale           # float
 ```
 """),
         ("bev", """\
@@ -83,22 +84,11 @@ Objects are annotated with automatic motion detection:
 Works with any number of frames (1 or more). With a single frame, all objects get bounding boxes (no trajectory possible).
 
 ```python
-# Reconstruct from InputImages (frame indices auto-extracted)
-recon = tools.Reconstruct.Reconstruct(InputImages[:32])
-
-# BEV with object annotations from SAM3 masks
-recon.render_bev(masks=seg)
-recon.render_bev(masks=seg, labels=seg.labels)
-
-# BEV with egomotion trajectory (camera path)
-recon.render_bev(masks=seg, ego_trajectory=True)
-
-# BEV with raw mask array + explicit labels
-recon.render_bev(masks=mask_arr, labels=["car", "person"])
-
-# Re-render with different reference camera (use absolute frame index)
-fi = recon.frame_indices[5]  # get absolute frame index
-recon.render_bev(masks=seg, ref_frame=fi)
+window = tools.Video.window(num_frames=32)
+recon = tools.Reconstruct.run(window)
+track = tools.SAM3.track("car", window)
+show(recon.render_bev(masks=track))                       # objects + camera path
+show(recon.render_bev(masks=track, ref_frame=window[5]))  # different reference camera
 ```
 """),
         ("pose_convention", """\
@@ -129,38 +119,28 @@ cam_fwd    = pose[:3, 2]   # camera +Z axis (forward/into scene) in world
         # to preserve the existing trajectory-line behaviour.
         self._is_video = bool(getattr(metadata, "is_video", True))
 
-    def Reconstruct(
+    def run(
         self,
         frames: List[Image.Image],
         frame_indices: Optional[List[int]] = None,
     ) -> Reconstruction:
-        """Perform 3D/4D reconstruction.
+        """3D reconstruction of ``frames`` (a window from ``tools.Video.window``).
 
         Args:
-            frames: List of PIL images or FrameImage objects (max ``MAX_FRAMES``).
-                When FrameImage objects are passed, frame_indices are
-                auto-extracted.
-            frame_indices: Absolute video frame indices.  Optional — if
-                ``None`` and *frames* contain ``FrameImage`` objects, indices
-                are auto-extracted from them.
+            frames: FrameImage list (max ``MAX_FRAMES``); frame indices are
+                taken from the FrameImages. Raw PIL images need ``frame_indices=``.
+            frame_indices: Absolute video frame indices (raw PIL input only).
 
         Returns:
-            ``Reconstruction`` with gravity-aligned point maps, depth,
-            intrinsics, extrinsics, and a BEV ``VisualFeedback``.
+            ``Reconstruction`` — gravity-aligned points/depth/poses in metres.
         """
         frames = ensure_image_list(frames)
         if len(frames) == 0:
-            raise ValueError(
-                "Reconstruct requires at least 1 frame. "
-                "Pass InputImages[:N] or a list of PIL images."
-            )
+            raise ValueError("Reconstruct.run needs at least 1 frame — pass a window from tools.Video.window(...).")
         if len(frames) > self.MAX_FRAMES:
-            n = len(frames)
-            step = n // self.MAX_FRAMES + 1
             raise ValueError(
-                f"Reconstruct accepts at most {self.MAX_FRAMES} frames, "
-                f"got {n}. Subsample first, e.g.:\n"
-                f"  recon = tools.Reconstruct.Reconstruct(InputImages[::{step}])"
+                f"Reconstruct.run accepts at most {self.MAX_FRAMES} frames, got {len(frames)}. "
+                f"Subsample: tools.Video.window(..., num_frames={self.MAX_FRAMES})."
             )
 
         # Auto-extract frame_indices from FrameImage objects

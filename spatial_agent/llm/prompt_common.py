@@ -109,7 +109,7 @@ def vlm_api_section(**_kwargs) -> str:
 You have three ways to obtain visual information:
 
 - `show(visual_input)` — display image(s) inline in the next feedback so you can see them yourself.
-- `vlm.locate(visual_input, question)` → `str` — ask a grounding VLM for pixel coordinates of an object you describe. Up to 8 images per call.
+- `vlm.locate(frame, target)` → `Located` — ask a grounding VLM where `target` (a short description) is in one frame. `vlm.locate_box(frame, target)` for a bounding box; `vlm.locate_points(frame, [descriptions])` for several **named points** (endpoints, edges) in one call.
 - `vlm.ask_with_thinking(visual_input, question)` → `str` — ask a separate visual reasoner that deliberates over the provided frames and returns a text answer. Up to 64 images per call.
 
 ### Choosing a tool
@@ -117,8 +117,11 @@ You have three ways to obtain visual information:
 Each tool produces a particular shape of evidence:
 
 - `vlm.locate`             — pixel coordinates of an object you can describe in words.
-- `tools.SAM3`             — per-frame masks given a point/box or text prompt.
-- `tools.Reconstruct`      — 3D geometry, depth, camera pose for a frame range.
+- `tools.SAM3`             — masks: every instance on one frame (`segment`), or one object followed across a window (`track`).
+- `tools.TAP`              — one pixel point followed across a window.
+- `tools.Reconstruct`      — 3D geometry, depth, camera pose for a window.
+- `tools.Video`            — frames and windows by time / absolute frame index.
+- `tools.Motion`           — velocity/acceleration from (time, position) samples.
 - `tools.Geometry`         — numeric ops on coordinates and arrays.
 - `tools.Mask`             — mask statistics (centroid, area, IoU).
 - `show()`                 — you look at images yourself and decide.
@@ -134,16 +137,20 @@ Use a tool when its evidence shape matches what the question needs AND you expec
 
 ### Working with `vlm.locate`
 
-Ask for coordinates in 0-1000 normalized scale.
-- Center point: `vlm.locate(image, "Give the (x, y) center coordinates in 0-1000 normalized scale for <object>. Reply with ONLY the numbers.")` → use with `tools.SAM3.segment_image_by_points()`.
-- Bounding box: `vlm.locate(image, "Give the bounding box (x1, y1, x2, y2) in 0-1000 normalized scale for <object>. Reply with ONLY the numbers.")` → use with `tools.SAM3.segment_image_by_box()`.
-Convert to pixels:
 ```
-px, py = tools.Geometry.normalized_to_pixel((vlm_x, vlm_y), W, H)
+loc = vlm.locate(frame, "the red car")          # Located(visible, xy, raw) — xy in PIXELS
+if loc.visible:
+    seg = tools.SAM3.segment_at(frame, point=loc.xy)
+box = vlm.locate_box(frame, "the red car")      # Located(visible, xy, box, raw) — box = (x1, y1, x2, y2) pixels
+top, bottom = vlm.locate_points(frame, ["topmost point of the helmet", "lowest point of the boots"])
+if top.visible and bottom.visible:
+    px_len = tools.Geometry.distance(top.xy, bottom.xy)          # pixels
+    m = recon.distance(frame, top.xy, bottom.xy)                  # metres, same frame (needs recon = tools.Reconstruct.run(...))
 ```
+Measure sizes and lengths this way — two named points, then `Geometry.distance` (pixels) or `recon.distance` (metres) — instead of estimating "about twice the ..." by eye.
+`frame` is one frame (`tools.Video.frame_at_time(t)`, `InputImages[i]`); `target` is a short description. Coordinates are already in pixels — no conversion.
+`.visible` is `False` when the object is absent or ambiguous — then try a different frame, refine the description, or first find the right frame with `vlm.ask_with_thinking`. Never read `.xy` without checking `.visible`.
 Estimating coordinates yourself by eye is unreliable — call `vlm.locate` for grounding.
-
-`vlm.locate` may return the literal string `Not visible` (optionally followed by a short note) when the requested object/annotation is absent or ambiguous in the image. Always check for this before parsing the answer as coordinates; if you see it, try a different frame, refine the description, or first locate the target frame with `vlm.ask_with_thinking`.
 
 ### Working with `vlm.ask_with_thinking`
 
@@ -159,7 +166,7 @@ Multiple consistent answers across calls are stronger evidence than a single cal
 
 ### Pitfalls
 
-- **NEVER** overwrite the `vlm` or `feedback` variables: `vlm = vlm.locate(...)` or `feedback = feedback.show(...)` destroys the module. Always assign to a different name: `coords = vlm.locate(...)`, `answer = vlm.ask_with_thinking(...)`."""
+- **NEVER** overwrite the `vlm` or `feedback` variables: `vlm = vlm.locate(...)` or `feedback = feedback.show(...)` destroys the module. Always assign to a different name: `loc = vlm.locate(...)`, `answer = vlm.ask_with_thinking(...)`."""
 
 
 def return_answer_section() -> str:
@@ -210,12 +217,12 @@ There are four coordinate spaces, and they can disagree:
 
 Given a target object's 3D position and the camera pose at the reference time:
 ```python
-# Get 3D position using absolute frame index
-fi = seg.frame_indices[0]                         # use absolute frame index
-target_3d = seg.get_centroid_3d(recon, frame=fi, object=0)  # (3,) or None
+# 3D position of the target on the reference frame
+seg = tools.SAM3.segment("the car", frame)
+target_3d = recon.centroid(frame, seg.mask())    # (3,) or None
 
-# Get camera pose at the SAME frame
-pose = recon.extrinsics[fi]   # (4, 4) c2w at reference time
+# Camera pose at the SAME frame
+pose = recon.extrinsics[frame]   # (4, 4) c2w at reference time
 cam_pos = pose[:3, 3]         # camera position in world
 cam_fwd = pose[:3, 2]         # camera forward (into scene) in world
 cam_right = pose[:3, 0]       # camera right in world
@@ -325,7 +332,8 @@ def robust_computation_section() -> str:
 - **Never trust a single frame.** Compare across multiple frames — consistent values are reliable, one-off values are noise.
 - **Reason in metric units, not pixels.** Always convert to meters/degrees/m·s⁻¹ before judging significance (e.g., a 2px shift is meaningless without depth context).
 - **Sanity-check magnitudes** (e.g., pedestrian ~1-2 m/s, car ~10-30 m/s, angular noise < 2°, real rotation > 5°). If results violate common sense, suspect bad inputs.
-- **Print values before concluding.** When margins are small relative to measurement noise, acknowledge low confidence."""
+- **Print values before concluding.** When margins are small relative to measurement noise, acknowledge low confidence.
+- **Never invent a constant to get past an error.** If a step raises `NameError`/`AssertionError`/etc., the fix is to correct the code or re-run the measurement that produced the missing value — not to hardcode a plausible-looking number (a scale factor, a pixel-to-metric ratio, a frame count) so the next cell runs. A guessed constant silently becomes the final answer's precision; if you can't recover the real value, say so and try a different tool/window rather than substituting one."""
 
 
 def code_rules_section(num_videos: int = 1) -> str:

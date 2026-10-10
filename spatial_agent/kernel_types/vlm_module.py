@@ -4,21 +4,24 @@ Injected into the kernel as ``vlm``. Each method opens an isolated VLM
 session: the VLM sees only the images and the question — no conversation
 history, no prior reasoning from the main agent.
 
-- ``vlm.locate(visual_input, question)``        — coordinate grounding,
-  short answers, up to 8 images per call.
+- ``vlm.locate(frame, target)`` / ``vlm.locate_box(frame, target)`` —
+  coordinate grounding on one frame, returns ``Located`` in pixels.
 - ``vlm.ask_with_thinking(visual_input, question)`` — visual reasoning
   with extended thinking budget, up to 64 frames per call.
 
 Usage in the Jupyter kernel::
 
-    coords = vlm.locate(InputImages[5], "Give the (x, y) center coordinates in 0-1000 normalized scale for the car. Reply with ONLY the numbers.")
+    loc = vlm.locate(InputImages[5], "the car")
+    if loc.visible: x, y = loc.xy
     answer = vlm.ask_with_thinking([InputImages[0], InputImages[15], InputImages[30]], "Across these frames, does the person walk toward or away from the camera?")
 """
 
 import asyncio
 import concurrent.futures
 import os
-from typing import Any, Dict, List, Optional, Union
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from PIL import Image
 
@@ -27,6 +30,35 @@ from spatial_agent.kernel_types.visual_feedback import VisualFeedback
 
 _LOCATE_MAX_IMAGES = 8
 _THINKING_MAX_IMAGES = 64
+_NUM = r"-?\d+(?:\.\d+)?"
+_PAIR_RE = re.compile(rf"\(?\s*({_NUM})\s*[, ]\s*({_NUM})\s*\)?")
+_QUAD_RE = re.compile(rf"\(?\s*({_NUM})\s*[, ]\s*({_NUM})\s*[, ]\s*({_NUM})\s*[, ]\s*({_NUM})\s*\)?")
+_ITEM_LINE_RE = re.compile(r"^\s*\**(\d+)\**\s*[:.)\]-]\s*(.*)$")
+
+
+@dataclass
+class Located:
+    """Result of ``vlm.locate`` / ``vlm.locate_box``. Coordinates are in **pixels**."""
+
+    visible: bool
+    xy: Optional[Tuple[float, float]] = None        # center point (pixels)
+    box: Optional[Tuple[float, float, float, float]] = None  # x1, y1, x2, y2 (pixels); locate_box only
+    raw: str = ""
+
+
+def _parse_pair(raw: str) -> Optional[Tuple[float, float]]:
+    """First adjacent number pair in the response ("420 390", "(420, 390)"), or None."""
+    if "not visible" in raw.lower():
+        return None
+    m = _PAIR_RE.search(raw)
+    return (float(m.group(1)), float(m.group(2))) if m else None
+
+
+def _parse_quad(raw: str) -> Optional[Tuple[float, float, float, float]]:
+    if "not visible" in raw.lower():
+        return None
+    m = _QUAD_RE.search(raw)
+    return tuple(float(m.group(i)) for i in range(1, 5)) if m else None
 
 
 _LOCATE_VERIFY_PREAMBLE = (
@@ -73,32 +105,98 @@ class VLMModule:
     # Public API (called from kernel code)
     # ------------------------------------------------------------------
 
-    def locate(
-        self,
-        visual_input: Union[VisualFeedback, Image.Image, List],
-        question: str,
-    ) -> str:
-        """Query the grounding VLM. Returns a short text answer (typically coordinates).
+    def _grounding_query(self, frame, question: str) -> Tuple[str, int, int]:
+        from spatial_agent.kernel_types.frame_image import FrameImage
 
-        Args:
-            visual_input: VisualFeedback, PIL.Image, or list of these (max 8).
-            question: Self-contained question, usually requesting
-                0-1000 normalized coordinates.
-
-        Returns:
-            Text answer from the isolated grounding VLM session. May be
-            ``"Not visible"`` (possibly with a short note) when the requested
-            target is absent or ambiguous; otherwise the requested coordinates.
-        """
-        wrapped_question = _LOCATE_VERIFY_PREAMBLE + question
-        return self._dispatch(
-            visual_input=visual_input,
-            question=wrapped_question,
+        plain = frame.image if isinstance(frame, FrameImage) else frame
+        if not isinstance(plain, Image.Image):
+            raise TypeError(
+                f"`frame` must be one FrameImage/PIL Image (e.g. tools.Video.frame_at_time(t)), "
+                f"got {type(frame).__name__}."
+            )
+        if not isinstance(question, str):
+            raise TypeError("`target` must be a short text description, e.g. 'the red car'.")
+        W, H = plain.size
+        raw = self._dispatch(
+            visual_input=plain,
+            question=_LOCATE_VERIFY_PREAMBLE + question,
             query_type="locate",
             system_prompt=self._locate_prompt,
             role_params=self._locate_role_params,
             max_images=_LOCATE_MAX_IMAGES,
         )
+        return raw, W, H
+
+    def locate(self, frame: Union[Image.Image, "FrameImage"], target: str) -> Located:
+        """Pixel center of ``target`` in ``frame``.
+
+        Returns ``Located(visible, xy, raw)``; ``xy`` is in **pixels**. Check
+        ``.visible`` before using ``.xy`` — it is False when the target is
+        absent/ambiguous or the answer could not be parsed.
+        """
+        raw, W, H = self._grounding_query(
+            frame,
+            f"Give the (x, y) center coordinates in 0-1000 normalized scale for: {target}. "
+            f"Reply with ONLY the two numbers, space-separated.",
+        )
+        pair = _parse_pair(raw)
+        if pair is None:
+            return Located(visible=False, raw=raw)
+        nx, ny = pair
+        return Located(visible=True, xy=(nx / 1000.0 * W, ny / 1000.0 * H), raw=raw)
+
+    def locate_points(self, frame: Union[Image.Image, "FrameImage"], descriptions: List[str]) -> List[Located]:
+        """Pixel positions of several *named points* on one frame, in one VLM call.
+
+        Use this for endpoints and edges — "topmost point of the helmet",
+        "bottom of the left boot", "left edge of the ball" — where ``locate``
+        (an object's center) is the wrong question. Returns one ``Located``
+        per description, in order; check each ``.visible`` before ``.xy``.
+        """
+        if (not isinstance(descriptions, (list, tuple)) or len(descriptions) == 0
+                or not all(isinstance(d, str) and d.strip() for d in descriptions)):
+            raise ValueError(
+                "`descriptions` must be a non-empty list of short point descriptions, "
+                "e.g. ['topmost point of the helmet', 'lowest point of the boots']."
+            )
+        numbered = "\n".join(f"{i + 1}. {d.strip()}" for i, d in enumerate(descriptions))
+        question = (
+            "For each numbered item below, give the (x, y) position in 0-1000 normalized scale "
+            "of exactly that point on the image. Reply with one line per item in the form "
+            "'<number>: x y' — or '<number>: Not visible' if that specific point cannot be seen. "
+            f"No other text.\n{numbered}"
+        )
+        raw, W, H = self._grounding_query(frame, question)
+        results = [Located(visible=False, raw=raw) for _ in descriptions]
+        for line in raw.splitlines():
+            m = _ITEM_LINE_RE.match(line)
+            if not m:
+                continue
+            idx = int(m.group(1)) - 1
+            if not (0 <= idx < len(descriptions)):
+                continue
+            pair = _parse_pair(m.group(2))
+            if pair is not None:
+                results[idx] = Located(visible=True, xy=(pair[0] / 1000.0 * W, pair[1] / 1000.0 * H), raw=line.strip())
+        return results
+
+    def locate_box(self, frame: Union[Image.Image, "FrameImage"], target: str) -> Located:
+        """Pixel bounding box of ``target`` in ``frame``.
+
+        Returns ``Located(visible, xy, box, raw)`` with ``box=(x1, y1, x2, y2)``
+        and ``xy`` = the box center, both in **pixels**.
+        """
+        raw, W, H = self._grounding_query(
+            frame,
+            f"Give the bounding box (x1, y1, x2, y2) in 0-1000 normalized scale for: {target}. "
+            f"Reply with ONLY the four numbers, space-separated.",
+        )
+        quad = _parse_quad(raw)
+        if quad is None:
+            return Located(visible=False, raw=raw)
+        x1, y1, x2, y2 = quad
+        box = (x1 / 1000.0 * W, y1 / 1000.0 * H, x2 / 1000.0 * W, y2 / 1000.0 * H)
+        return Located(visible=True, xy=((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), box=box, raw=raw)
 
     def ask_with_thinking(
         self,

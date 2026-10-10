@@ -1,0 +1,8 @@
+{
+    "benchmark": "quantiphy",
+    "video_max_fps": 4,
+    "num_key_frames": 8,
+    "tools_to_use": ["TAP"],
+    "max_steps": 15,
+    "enable_reflection": false
+}
